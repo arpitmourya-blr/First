@@ -13,8 +13,22 @@ workspace count (ws)    = dmCount (ws) + bellCount (ws) + callCount (ws)
 ```
 
 - Every event lands in exactly one shelf: **DM shelf**, **bell shelf**, or **call shelf**.
-- Dock is never designed separately — it renders `Σ workspace counts` from the same polling state as the switcher. If the dock shows 32, the switcher rows sum to 32; if a workspace shows 12, its DM rail + bell + calls badges sum to 12.
+- The dock is never designed separately — it renders `Σ workspace counts` from the same polling state as the switcher. Dock shows 32 → switcher rows sum to 32. A workspace shows 12 → its DM rail + bell + calls badges sum to 12.
 - Bell *feed behavior* stays as-is (rows visible in the feed unchanged). Only *counting* changes.
+
+### Transport split (decided)
+
+| Surface | Transport | Source |
+|---|---|---|
+| Dock badge | **HTTP poll** (30s + refetch triggers) | Σ workspace counts via shared hook |
+| Workplace switcher | **HTTP poll** (same hook, same state) | per-workspace `count` |
+| DM rail badge | **Zero sync (live)** | Σ per-channel DM unreads, client-side (`useDmUnreadCount`, new) |
+| Bell badge | **Zero sync (live)** | `useUnreadActivitiesCount` (existing, filters updated) |
+| Calls rail badge | **Zero sync (live)** | `useMissedCallCount` (existing, untouched) |
+
+The server computes the same three parts for the polled total; the client derives the same three numbers from Zero for the rails. Same predicate, same rows, two transports. Rails are live; dock/switcher lag ≤30s (accepted).
+
+**Why this dissolves the dmCount-subtraction precision risk:** the DM rail and DM list badges derive from the same Zero state through the same hook — the rail *is* the sum of the list, so drill-down consistency is automatic. Edge cases (multi-mention, keyword overlap, mark-unread timing) affect client and server computations identically, so they cannot cause user-visible divergence — consistency is guaranteed even if a rare edge case makes both sides "off" in the same way. The remaining requirement is **implementation parity** (§3.1), enforced by tests.
 
 ## 2. Final target matrix — every event, its shelf
 
@@ -40,232 +54,184 @@ workspace count (ws)    = dmCount (ws) + bellCount (ws) + callCount (ws)
 | Unread in closed/archived channel | ○ | ○ | ○ | ○ | ○ ⁶ |
 | Daily recap | ○ | ○ | ○ | ○ | ○ |
 
-¹ dmCount subtracts unread top-level mention activities in GROUP_DM channels (mention wins the bucket — your Q1 decision). Per-channel DM badges apply the same subtraction so the DM list sums to the DM rail.
+¹ dmCount subtracts unread top-level mention activities in GROUP_DM channels (mention wins the bucket). The subtraction is applied **per-channel on the client** (rail + list badges, same hook) and **in aggregate on the server** (same predicate) — see §3.1.
 ² Reaction rows create a **dot** (no number) on the DM channel row and the DM rail (only when the numeric badge is 0), and on the bell. Cleared on view. Never a number anywhere.
-³ Not counted anywhere; visible only when opening the channel itself (your decision).
-⁴ SKIP = nothing, everywhere, this phase. Classification rework deferred to later PRs.
-⁵ ERROR rows count like PENDING (LLM failure is not the user's problem to infer; counting them is the simpler consistent default until the classification rework).
+³ Not counted anywhere; visible only when opening the channel itself.
+⁴ SKIP = not counted anywhere; current bell filter logic kept verbatim; classification rework deferred to a later PR. (Open Q1: whether "do not classify anything to skip" means actively coercing all SKIP verdicts to FYI now, or leaving the pipeline untouched.)
+⁵ ERROR rows counted (decided): LLM failure must not lose potentially important counts; revisit in the classification PR.
 ⁶ Excluded from all counts; reappear if the channel is reopened (accepted).
 
-**Key behavioral changes vs today** (rows that change):
-- Missed calls: workplace **starts counting** them (via callCount) — today the raw server count includes them but under the new three-way split they're explicit.
-- Channel removals: workplace **stops counting** them (today's unfiltered server count includes them).
-- DM thread replies: dock **starts counting** them (bell shelf — today's dock excluded threads).
-- Tickets/channel-less: dock **starts counting** them.
-- Closed-channel rows: bell **stops counting** them (new filter).
-- GROUP_DM top-level mentions: dmCount **subtracts** them (mention wins).
-- Bell: `removed` filter stays (already excluded), `missed_call` filter stays (call shelf), **new** closed-channel filter.
+**Key behavioral changes vs today:**
+- Missed calls: workplace/dock start counting them (via callCount).
+- Channel removals: workplace stops counting them (today's unfiltered server count includes them).
+- DM thread replies: dock starts counting them (bell shelf — today's dock excluded threads).
+- Tickets/channel-less: dock starts counting them.
+- Closed-channel rows: bell stops counting them (new filter).
+- GROUP_DM top-level mentions: dm shelf subtracts them (mention wins).
+- Bell: `removed` and `missed_call` filters stay; **new** closed-channel filter and full `direct_message` (legacy) exclusion.
 
 ## 3. Backend changes
 
-### 3.1 Shared filter constant (new file)
+### 3.1 Shared predicate constant (new, in `packages/shared`)
 
-`apps/backend/src/services/activity/unreadActivityFilters.ts` (or shared package so dashboard can import):
+The single source of truth for "what counts as a bell-shelf unread activity" and "what the dm shelf subtracts," imported by both the dashboard hooks and the backend endpoint:
 
 ```ts
-export const BELL_COUNT_FILTER = {
-  excludedActorActions: ['added_v2', 'removed'],       // reactions, channel removals
+// packages/shared/src/unread/bellCountRules.ts
+export const BELL_COUNT_RULES = {
+  excludedActorActions: ['added_v2', 'removed'],
   excludedCalls: { actionSource: 'call', actorAction: 'missed_call' },
-  excludedClassifications: ['SKIP', 'ERROR'],          // ERROR excluded? — see open Q1
-  requireDirectMessageGate: false,                     // legacy direct_message rows: exclude
-  excludeClosedChannels: true,                         // new rule
+  excludedClassifications: ['SKIP'],            // ERROR + PENDING counted
+  excludedLegacyDirectMessages: true,           // actorAction = 'direct_message' → dm shelf's domain
+  excludeClosedChannels: true,
+  dmShelf: {
+    channelScopes: ['DM', 'GROUP_DM'],
+    subtractUnreadTopLevelMentions: true,       // GROUP_DM only; isThreadActivity = false
+  },
 } as const;
 ```
 
-This is the single source of truth. The server count and the client hook both derive from it. Today the same rules live in two client hooks and nowhere server-side — the root cause of the entire divergence.
+Client (zql filter in the hooks) and server (Prisma `where` in the endpoint) each adapt these rules to their query builder. **Parity tests** (§7) assert both adapters return the same set on golden fixtures — this replaces the earlier "subtraction precision" risk with a mechanical guarantee.
 
 ### 3.2 Extend `activityService.getWorkspaceActivityCounts` ([activityService.ts:716](apps/backend/src/services/activity/activityService.ts#L716))
 
-Additive response (old `count` retained for compat during rollout):
+**Response shape — minimal** (no rail consumes the poll anymore):
 
 ```ts
-// today:   { workspaceId, userId, count }
-// target:  { workspaceId, userId, dmCount, bellCount, callCount, count }
-//          count = dmCount + bellCount + callCount
+// today:  { workspaceId, userId, count }              // count = raw unread activities (unfiltered)
+// target: { workspaceId, count }                      // count = dmCount + bellCount + callCount
 ```
 
-**`bellCount`** — groupBy on activities with the shared filter:
+Computed internally, not exposed:
 
-```sql
-activities WHERE userId IN (identities) AND isRead = false
-  AND actorAction NOT IN ('added_v2', 'removed')
-  AND NOT (actionSource = 'call' AND actorAction = 'missed_call')
-  AND classification NOT IN ('SKIP', 'ERROR')            -- open Q1 on ERROR
-  AND (actorAction != 'direct_message')                  -- legacy DM rows excluded; their content is dmCount's job
-  AND channel-is-not-closed                              -- join or anti-join vs channel_user_status
-```
+- **`dmCount`** = `SUM(channel_user_status.unreadCount)` over the user's open (`isClosed = false`, `isDeleted = false`) DM/GROUP_DM channels **minus** unread top-level mention activities in GROUP_DM channels (per §3.1 rules; floored at 0 per channel).
+- **`bellCount`** = `COUNT(activities)` where `isRead = false` and the §3.1 bell rules (excludes `added_v2`, `removed`, `missed_call`, SKIP, legacy `direct_message`; excludes closed channels; counts ERROR/PENDING).
+- **`callCount`** = `COUNT(activities)` where `actionSource = 'call' AND actorAction = 'missed_call' AND isRead = false` — identical semantics to the Calls rail's `userMissedCalls` Zero query ([queries.ts:2463](packages/shared/src/zero/queries.ts#L2463)).
 
-Closed-channel check: `channelId IS NULL OR channel_user_status(userId, channelId).isClosed = false`. Needs the join to `channel_user_status` (or a two-step: fetch closed channelId set for the user, then `NOT IN`).
+Also merge identities server-side: `groupBy workspaceId, SUM` — removes the switcher's last-write-wins merge risk ([WorkspaceSwitcher.tsx:107-110](apps/dashboard/src/components/AppSidebar/WorkspaceSwitcher.tsx#L107-L110)) if a member ever holds two identities in one workspace.
 
-**`callCount`** — groupBy on activities:
-
-```sql
-activities WHERE userId IN (identities) AND isRead = false
-  AND actionSource = 'call' AND actorAction = 'missed_call'
-```
-
-Identical semantics to the Calls rail's `userMissedCalls` Zero query ([queries.ts:2463](packages/shared/src/zero/queries.ts#L2463)) — same rows, different transport.
-
-**`dmCount`** — the new aggregate:
-
-```sql
-SELECT SUM(cus.unreadCount) FROM channel_user_status cus
-JOIN channels c ON c.id = cus.channelId
-WHERE cus.userId IN (identities)
-  AND c.scopeType IN ('DM', 'GROUP_DM')
-  AND cus.isClosed = false AND cus.isDeleted = false
-MINUS unread GROUP_DM top-level mention activities        -- mention-wins subtraction, open Q2
-```
-
-The subtraction (Q1 decision) — conceptually:
-
-```sql
-- (count of unread activities WHERE actorAction IN ('mentioned_user','group_mention')
-    AND actionSource = 'message' AND isThreadActivity = false
-    AND channel.scopeType = 'GROUP_DM' AND isRead = false)
-```
-
-⚠️ **Precision risk — open Q2:** this subtracts *activity rows*, but dmCount counts *conversation rows*. When one GROUP_DM message mentions 3 users, 3 activity rows exist but the sender's conversation row is 1. Per-user this aligns (each mentioned user has 1 row and the channel counter is per-user too), but **batched `replied_v2` rows** (one row per conversation, updated per reply) and messages with multiple mentions of the same user need verification. I'll write a unit test matrix for this before finalizing the SQL.
+⚠️ **Rollout note:** the `count` field's *meaning* changes (raw unfiltered → dm+bell+call). Only known consumer is the switcher (migrating in the same release); verify no mobile/other consumers before deploy.
 
 ### 3.3 Fix the frozen DM counter (Phase 0 — prerequisite)
 
-`handleUnreadCount` skips recompute when `channel_stats.lastActivityAt <= lastViewedAt` ([unreadCountUtlis.ts:37](apps/backend/src/zero/utils/unreadCountUtlis.ts#L37)), but ordinary messages never update `channel_stats.lastActivityAt`.
+`handleUnreadCount` skips recompute when `channel_stats.lastActivityAt <= lastViewedAt` ([unreadCountUtlis.ts:37](apps/backend/src/zero/utils/unreadCountUtlis.ts#L37)), but ordinary messages never update `channel_stats.lastActivityAt` — only channel creation, membership changes, and calls do. Once you've viewed a DM channel, every future recompute for it is silently skipped → `unreadCount` frozen at 0.
 
-**Fix:** in `conversations-handler.ts` `onInsert` ([conversations-handler.ts:39-45](apps/backend/src/zero/side-effects/tables/conversations-handler.ts#L39-L45)), before calling `handleUnreadCount`, upsert-bump `channel_stats.lastActivityAt = conversation.createdAt`. One write per conversation insert (already a write path — negligible cost). Alternatively drop the guard entirely; the bump is safer (keeps the cheap-path optimization for quiet channels).
+**Fix:** in `conversations-handler.ts` `onInsert` ([conversations-handler.ts:39-45](apps/backend/src/zero/side-effects/tables/conversations-handler.ts#L39-L45)), bump `channel_stats.lastActivityAt = conversation.createdAt` before calling `handleUnreadCount`. ~3 lines in one file.
 
-Without this, dmCount freezes at 0 for viewed channels and the invariant breaks at its foundation.
+Now doubly critical: the DM rail renders `channel_user_status.unreadCount` **directly** via Zero — without this fix the new rail badge is frozen for every viewed channel.
 
-### 3.4 Endpoint exposure
+### 3.4 What does NOT change on the backend
 
-No new routes. `GET /activity/workspace-counts` ([activityLog.ts:28](apps/backend/src/routes/activityLog.ts#L28)) response shape changes additively. Response contract:
-
-```ts
-{ counts: Array<{ workspaceId: string; dmCount: number; bellCount: number; callCount: number; count: number }> }
-```
-
-(Keep `userId` in the internal service return; strip or keep in response — check current consumers first: only [WorkspaceSwitcher.tsx:103](apps/dashboard/src/components/AppSidebar/WorkspaceSwitcher.tsx#L103) and [useElectronBadge.ts](apps/dashboard/src/hooks/useElectronBadge.ts) docs reference it.)
-
-Also fix the identity-merge edge while here: the switcher's last-write-wins map ([WorkspaceSwitcher.tsx:107-110](apps/dashboard/src/components/AppSidebar/WorkspaceSwitcher.tsx#L107-L110)) should **sum** counts per workspaceId if a member ever holds two identities in one workspace. Backend can do this merge server-side (groupBy workspaceId, sum) — cleaner than client-side merging.
-
-### 3.5 What does NOT change on the backend
-
-- Zero mutators (`markChannelAsViewed`, `markChannelUnreadFrom`, `markMissedCallsAsRead`, activity read mutators) — untouched; they remain the write path that Zero syncs.
+- Zero mutators (`markChannelAsViewed`, `markChannelUnreadFrom`, `markMissedCallsAsRead`, activity read mutators) — untouched; they remain the write path Zero syncs.
 - Activity creation side-effects — untouched. No row is created or suppressed differently.
-- Classification pipeline — untouched (SKIP = nothing this phase; rework deferred).
+- Classification pipeline — untouched this phase (SKIP handling per §2 note 4 / open Q1).
 - `userMissedCalls` query, Calls rail — untouched.
 
 ## 4. Frontend changes
 
-### 4.1 New shared hook `useWorkspaceUnreadCounts`
+### 4.1 Shared polling hook `useWorkspaceUnreadCounts` — dock + switcher only
 
 `apps/dashboard/src/hooks/useWorkspaceUnreadCounts.ts`:
 
 ```ts
-type WorkspaceUnread = { dmCount: number; bellCount: number; callCount: number; count: number };
 // exposes:
-//   byWorkspace: Record<workspaceId, WorkspaceUnread>
-//   totalAllWorkspaces: number          // Σ count — dock value
-//   activeWorkspace: WorkspaceUnread | undefined
+//   byWorkspace: Record<workspaceId, number>
+//   totalAllWorkspaces: number     // dock value
 //   refetch: () => void
 ```
 
-Behavior:
-- Poll `GET /activity/workspace-counts` every **30s** (matches current switcher cadence)
-- **Refetch triggers** (perceived-instant updates): window focus, `visibilitychange → visible`, and a custom app event `unread:refetch` dispatched after read-mutations
-- Single instance mounted high in the tree (next to `ElectronBadgeSync` in [AppRoot.tsx:968](apps/dashboard/src/routes/AppRoot.tsx#L968)); consumers subscribe via context, not by each spawning their own poll
+- Polls `GET /activity/workspace-counts` every **30s**
+- Refetch triggers (perceived-instant dock updates): window focus, `visibilitychange → visible`, custom `unread:refetch` event emitted after read-mutations
+- Single instance mounted next to `ElectronBadgeSync` ([AppRoot.tsx:968](apps/dashboard/src/routes/AppRoot.tsx#L968)); consumers via context
+- No rail consumes this hook — rails are Zero-synced
 
-Read-mutation refetch triggers (dispatch `unread:refetch` on success):
-- `markChannelAsViewed` / `markChannelUnreadFrom` / `closeDm` / `reopenDm` call sites (ChatList, ConversationPanel)
-- Activity `markAsRead` / `markAsReadByFilter` call sites (ActivityListView)
-- `markMissedCallsAsRead` call site ([CallHistoryScreen.tsx:585](apps/dashboard/src/routes/CallHistoryScreen/CallHistoryScreen.tsx#L585))
-
-Implementation note: wrap the mutate calls or hook into the existing state-machine `SET_*` events — whichever is less invasive; the state machine already observes these mutations (its `unreadActivities`/`userChannelStatuses` context updates on them), so emitting `unread:refetch` from the same observers avoids touching every call site.
+Read-mutation refetch triggers: emit `unread:refetch` from the state-machine observers that already track these mutations (cleaner than touching every call site): `markChannelAsViewed` / `markChannelUnreadFrom` / `closeDm` / `reopenDm`, activity `markAsRead` / `markAsReadByFilter`, `markMissedCallsAsRead` ([CallHistoryScreen.tsx:585](apps/dashboard/src/routes/CallHistoryScreen/CallHistoryScreen.tsx#L585)).
 
 ### 4.2 `useElectronBadge` — source switch ([useElectronBadge.ts](apps/dashboard/src/hooks/useElectronBadge.ts))
 
 ```ts
-// before: const unreadCounts = useAllUnreadCount(); total = Σ values
+// before: total = Σ useAllUnreadCount() values
 // after:  const { totalAllWorkspaces } = useWorkspaceUnreadCounts();
-//         api.setBadgeCount(totalAllWorkspaces);
 ```
 
-Remove `useAllUnreadCount` import; update the doc comment (the "active workspace only / follow-up" note is resolved by this change). Behind flag `DOCK_BADGE_POLL_SOURCE` for rollout.
+Update the doc comment (the "active workspace only" limitation is resolved). Behind flag `DOCK_BADGE_POLL_SOURCE`.
 
 ### 4.3 `WorkspaceSwitcher` — migrate to shared hook
 
-Replace private `fetchActivityCounts` + `setInterval` + `activityCounts` state ([WorkspaceSwitcher.tsx:100-170](apps/dashboard/src/components/AppSidebar/WorkspaceSwitcher.tsx#L100-L170)) with `useWorkspaceUnreadCounts().byWorkspace`. Rendered value unchanged (`count` per row). The server-side identity merge (3.4) removes the last-write-wins risk.
+Replace private `fetchActivityCounts` + `setInterval` + state ([WorkspaceSwitcher.tsx:100-170](apps/dashboard/src/components/AppSidebar/WorkspaceSwitcher.tsx#L100-L170)) with `byWorkspace` from the shared hook. Rendered value: plain number (decided — decomposition lives on the rail badges).
 
-### 4.4 DM rail badge + reaction dot ([AppSidebar.tsx:328, 415-460](apps/dashboard/src/components/AppSidebar/AppSidebar.tsx#L328))
+### 4.4 New `useDmUnreadCount` — Zero-synced DM rail badge
 
-On the `/chat/dm` rail item:
-- **Numeric badge** = `activeWorkspace.dmCount` (styled like the missed-call badge: `99+` cap, same classes)
-- **Reaction dot** when `dmCount === 0` and any unread `added_v2` activity exists in a DM/GROUP_DM channel — replaces/extends `hasPendingDirectMessages` (currently "any DM unread > 0"); new source: the existing `unreadActivities` state (filter: `added_v2` + channel is DM)
-- Bell rail item: numeric badge unchanged (`useUnreadActivitiesCount`), **plus reaction dot** when its count is 0 and unread `added_v2` rows exist in non-DM channels
-- Calls rail: unchanged (existing `useMissedCallCount`)
+`apps/dashboard/src/hooks/useDmUnreadCount.ts`:
+
+```ts
+// Σ over visible DM/GROUP_DM channels of:
+//   max(0, channelUserStatus.unreadCount − unreadTopLevelMentionRows(channelId))
+// where mention rows = unread activities, actorAction IN (mentioned_user, group_mention),
+//   actionSource = 'message', isThreadActivity = false, channel scopeType = GROUP_DM
+```
+
+- Zero-synced (live) — derived from the same state as the DM list badges (see 4.6), so rail = Σ list by construction
+- Numeric badge on the `/chat/dm` rail item (missed-call styling, `99+` cap)
+- **Reaction dot** when the number is 0 and unread `added_v2` rows exist in DM/GROUP_DM channels — extends `hasPendingDirectMessages` ([AppSidebar.tsx:328](apps/dashboard/src/components/AppSidebar/AppSidebar.tsx#L328)); cleared on view
+- Bell rail item: numeric badge unchanged, **plus reaction dot** when its count is 0 and unread `added_v2` rows exist in non-DM channels
 
 ### 4.5 `useUnreadActivitiesCount` — filter updates ([useUnreadActivitiesCount.ts](apps/dashboard/src/hooks/useUnreadActivitiesCount.ts))
 
-New rules to match the server's bellCount exactly:
-- **Add** closed-channel exclusion (rows whose channel `isClosed` — the query already relates `channel`, so filter on the related field)
-- **Add** `direct_message` full exclusion (currently the ACTIONABLE/FYI gate; since dmCount owns DM top-levels, all legacy `direct_message` rows go to zero)
+Match the server's bellCount exactly, derived from the shared rules (§3.1):
+- **Add** closed-channel exclusion (query already relates `channel`)
+- **Add** full `direct_message` exclusion (replaces the ACTIONABLE/FYI gate — legacy rows are dm-shelf content)
 - Keep: `added_v2`, `removed`, `missed_call`, `SKIP` exclusions
-- Decide ERROR (open Q1): current hook counts ERROR (only SKIP filtered); server plan excludes — must match whichever you pick
+- ERROR and PENDING: counted (current behavior for ERROR; no change needed — only SKIP is filtered today)
 
-Derive from the shared filter constant (3.1) so client and server can't drift.
+### 4.6 `useAllUnreadCount` — per-channel GROUP_DM mention subtraction
 
-### 4.6 Per-channel DM badges — mention subtraction (DmsPage, UnreadsInbox, MobileChatDirectory, GlobalCommandMenu)
+The DM list badges (and 4.4's rail) must subtract that channel's unread top-level mention rows for GROUP_DM channels, floored at 0. `useAllUnreadCount` already has `unreadActivities` and `userChannelStatuses` in scope ([useUnreadCount.ts:12,14](apps/dashboard/src/hooks/useUnreadCount.ts#L12)) — extend it once; all consumers fixed (DmsPage, UnreadsInbox, MobileChatDirectory, GlobalCommandMenu). The activity-half (non-DM rows) also gets the closed-channel exclusion to match bellCount.
 
-All four consume `useAllUnreadCount()` for per-channel badges. For GROUP_DM channels, the displayed badge must subtract that channel's unread top-level mention activities (Q1 decision), so the DM list sums to the DM rail number.
+### 4.7 Bell count vs feed display (unchanged feed)
 
-Implementation: extend `useAllUnreadCount` — it already has both `unreadActivities` and `userChannelStatuses` in scope ([useUnreadCount.ts:12,14](apps/dashboard/src/hooks/useUnreadCount.ts#L12)); for GROUP_DM channels compute `status.unreadCount − unreadMentionRows(channelId)` and floor at 0. Single place, all consumers fixed.
+The bell *feed* continues to render rows the *count* excludes (e.g., missed-call cards). Deliberate: "keep activities as they were." The bell number may be less than visible feed items — accepted.
 
-### 4.7 `useAllUnreadCount` — closed-channel filter
+## 5. Open question
 
-It derives from `visibleChannels` (already `isClosed = false` via `userVisibleChannelsV3`) — the channel-half is already correct. The activity-half (non-DM rows) needs the closed-channel exclusion added to match bellCount. Fold into 4.5/4.6's shared-constant refactor.
+**Q1 — "do not classify anything to skip":** two readings —
+- **(a)** actively extend the `mapClassification` coercion ([activityClassificationService.ts:1191](apps/backend/src/services/activity/activityClassificationService.ts#L1191)) so *all* LLM SKIP verdicts → FYI now (also stops the delete-on-SKIP path and its badge-count-then-vanish race; ~1-line change but touches the classification service), or
+- **(b)** leave the classification pipeline completely untouched this phase (current behavior: non-DM SKIP already coerces; DM SKIP rows deleted; new SKIP rows nearly impossible since XYNE-17185) — implement the "nothing is SKIP" state properly in the later classification PR.
 
-### 4.8 Bell count vs feed display (unchanged feed)
-
-The bell *feed* continues to show rows the *count* excludes (missed calls visible in feed? — today yes, as cards; reactions may render in feed too). We do not change feed rendering this phase. Note the deliberate consequence: bell number may be less than visible feed items (e.g., a missed call renders as a card but counts in the call shelf). Acceptable per "keep activities as they were."
-
-## 5. The three open questions
-
-**Q1 — ERROR rows:** count them (like PENDING) or exclude them (treat as classifier failure = no badge)? My lean: **exclude** — an infra failure shouldn't create badge noise; rows self-heal to PENDING on retry. But counting is the lower-drama default. Need your verdict.
-
-**Q2 — dmCount mention-subtraction precision:** activity rows vs conversation rows are 1:1 for top-level GROUP_DM messages per recipient (verified in the handlers), but I want a unit-test matrix covering: multi-mention of the same user in one message, mention + keyword overlap (one row per user — [messages-handler dedupes](apps/backend/src/zero/side-effects/tables/messages-handler.ts#L707)), and mark-unread re-adding rows, before locking the SQL. Flagging as risk, not blocker.
-
-**Q3 — switcher UI decomposition:** show `12` plain, or show/hover `7 DM · 4 bell · 1 call`? Data arrives either way; purely a UI choice. Default: plain `12` this phase.
+Counts behave identically either way (SKIP never counts). Lean: **(b)** — zero classification code touched, per "we will resolve this classification thing later."
 
 ## 6. Rollout
 
-1. **Phase 0:** frozen-counter fix (3.3) — independently shippable, fixes live DM badge bug today.
-2. **Phase 1a:** backend — shared filter constant + endpoint extension (additive) + server-side identity merge. Old clients unaffected.
+1. **Phase 0:** frozen-counter fix (§3.3) — independently shippable; fixes the live DM badge bug today.
+2. **Phase 1a:** backend — shared rules constant + endpoint change (`count` = dm+bell+call, identity merge). ⚠️ semantic change of `count`; verify external consumers first.
 3. **Phase 1b:** `useWorkspaceUnreadCounts` + WorkspaceSwitcher migration. Corrected numbers; no UI change.
-4. **Phase 1c:** bell filter updates (4.5) + per-channel DM subtraction (4.6) + rail badges/dots (4.4). Bell numbers change visibly (closed-channel rows drop, legacy DM rows drop).
-5. **Phase 1d:** dock source switch (4.2) behind `DOCK_BADGE_POLL_SOURCE` flag, default off; compare `|zeroSum − polledTotal|` in dev builds; flip on.
-6. **Monitoring:** endpoint latency + DB load on the new aggregates; alert if p95 > 200ms. Log invariant violations (`count ≠ dm+bell+call`) — should be structurally impossible.
+4. **Phase 1c:** bell filter updates (§4.5) + `useDmUnreadCount` rail badge + per-channel subtraction (§4.6) + reaction dots (§4.4). Rail numbers change visibly.
+5. **Phase 1d:** dock source switch (§4.2) behind `DOCK_BADGE_POLL_SOURCE`, default off; compare `|zeroSum − polledTotal|` in dev; flip on.
+6. **Monitoring:** endpoint latency + DB load (alert if p95 > 200ms); log invariant violations — `count ≠ dm+bell+call` (structurally impossible server-side) and `switcher(activeWs) ≠ dmRail + bell + calls` beyond the 30s freshness window.
 
 ## 7. Test matrix
 
-**Backend unit:** bellCount filter rules (each excluded type); callCount; dmCount (open/closed, DM/GROUP_DM, subtraction cases per Q2); identity merge; `count` invariant; backward-compat `count` field.
-**Backend integration:** member with 2 workspaces; member with 2 identities in 1 workspace; empty state; all-read state.
-**Frontend unit:** `useWorkspaceUnreadCounts` polling/focus/refetch logic; `useUnreadActivitiesCount` new filters; `useAllUnreadCount` GROUP_DM subtraction.
-**E2E (Electron):** the 18-row matrix as scenarios — DM arrives → dock+1, switcher+1, DM rail+1, bell 0; GROUP_DM mention → bell+1, dm rail 0; missed call → calls rail+1, workplace+1; reaction → dot only; read everything → dock clears on focus-refetch; closed channel → nothing counts; dock 32 → switcher sums 32 → DM list + bell + calls sum to 12 for workspace A.
-**Soak:** frozen-counter regression (DM to recently-viewed channel must increment); poll endpoint load.
+**Parity (new, replaces the precision risk):** golden fixture activity sets → client predicate (zql/hook) and server predicate (Prisma) must return identical counts. Fixtures cover: plain GROUP_DM message; mention; mention+keyword overlap (one row — [handler dedupes](apps/backend/src/zero/side-effects/tables/messages-handler.ts#L743)); mention+thread-reply rows for the same user; multi-user mention (3 rows, per-user 1:1); mark-unread re-marking (rows and counter re-align); read-clearing both together; closed-channel rows; ERROR/PENDING/SKIP rows.
+**Backend unit:** dmCount (open/closed, DM/GROUP_DM, subtraction cases); bellCount rules; callCount; identity merge; `count` sum invariant.
+**Frontend unit:** `useWorkspaceUnreadCounts` polling/focus/refetch; `useDmUnreadCount` subtraction + flooring; `useUnreadActivitiesCount` new filters.
+**E2E (Electron):** the §2 matrix as scenarios — DM arrives → dm rail +1 live, dock/switcher +1 on next poll; GROUP_DM mention → bell +1, dm rail 0; missed call → calls rail +1, workplace +1; reaction → dot only; read all → rails clear instantly (Zero), dock clears on refetch trigger; closed channel → nothing counts; dock 32 → switcher sums 32 → workspace A's rails sum to 12.
+**Soak:** frozen-counter regression (DM to a recently-viewed channel must increment the rail); poll endpoint load.
 
 ## 8. Files touched (summary)
 
 | File | Change |
 |---|---|
-| `apps/backend/src/services/activity/unreadActivityFilters.ts` | **new** — shared filter constant |
-| `apps/backend/src/services/activity/activityService.ts` | extend `getWorkspaceActivityCounts` (dm/bell/call) |
-| `apps/backend/src/zero/side-effects/tables/conversations-handler.ts` | bump `channel_stats.lastActivityAt` on insert |
-| `apps/dashboard/src/hooks/useWorkspaceUnreadCounts.ts` | **new** — shared polling hook + context |
+| `packages/shared/src/unread/bellCountRules.ts` | **new** — shared count rules constant |
+| `apps/backend/src/services/activity/activityService.ts` | `getWorkspaceActivityCounts` → `{workspaceId, count}` with dm+bell+call |
+| `apps/backend/src/zero/side-effects/tables/conversations-handler.ts` | bump `channel_stats.lastActivityAt` on insert (Phase 0) |
+| `apps/dashboard/src/hooks/useWorkspaceUnreadCounts.ts` | **new** — shared polling hook (dock + switcher only) |
+| `apps/dashboard/src/hooks/useDmUnreadCount.ts` | **new** — Zero-synced DM rail badge with mention subtraction |
 | `apps/dashboard/src/hooks/useElectronBadge.ts` | source switch to `totalAllWorkspaces` |
 | `apps/dashboard/src/components/AppSidebar/WorkspaceSwitcher.tsx` | migrate to shared hook |
-| `apps/dashboard/src/components/AppSidebar/AppSidebar.tsx` | DM rail numeric badge + reaction dots |
-| `apps/dashboard/src/hooks/useUnreadActivitiesCount.ts` | closed-channel + direct_message filters, shared constant |
-| `apps/dashboard/src/hooks/useUnreadCount.ts` | GROUP_DM mention subtraction for per-channel badges |
-| Read-mutation call sites / state machine | emit `unread:refetch` after read mutations |
+| `apps/dashboard/src/components/AppSidebar/AppSidebar.tsx` | DM rail numeric badge + reaction dots (dm + bell rails) |
+| `apps/dashboard/src/hooks/useUnreadActivitiesCount.ts` | closed-channel + direct_message filters from shared rules |
+| `apps/dashboard/src/hooks/useUnreadCount.ts` | GROUP_DM mention subtraction + closed-channel on activity half |
+| state machine / read-mutation observers | emit `unread:refetch` after read mutations |
 | `apps/dashboard/src/routes/AppRoot.tsx` | mount shared hook provider |
 
-Not touched: Zero mutators, activity creation side-effects, classification pipeline, Calls rail query, bell feed rendering.
+Not touched: Zero mutators, activity creation side-effects, classification pipeline (pending Q1), Calls rail query, bell feed rendering.
