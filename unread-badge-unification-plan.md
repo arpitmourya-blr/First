@@ -57,7 +57,7 @@ The server computes the same three parts for the polled total; the client derive
 ¹ dmCount subtracts unread top-level mention activities in GROUP_DM channels (mention wins the bucket). The subtraction is applied **per-channel on the client** (rail + list badges, same hook) and **in aggregate on the server** (same predicate) — see §3.1.
 ² Reaction rows create a **dot** (no number) on the DM channel row and the DM rail (only when the numeric badge is 0), and on the bell. Cleared on view. Never a number anywhere.
 ³ Not counted anywhere; visible only when opening the channel itself.
-⁴ SKIP = not counted anywhere; current bell filter logic kept verbatim; classification rework deferred to a later PR. (Open Q1: whether "do not classify anything to skip" means actively coercing all SKIP verdicts to FYI now, or leaving the pipeline untouched.)
+⁴ SKIP = not counted anywhere; current bell filter logic kept verbatim; classification rework deferred to a later PR (Q1 decided → (b), see §5).
 ⁵ ERROR rows counted (decided): LLM failure must not lose potentially important counts; revisit in the classification PR.
 ⁶ Excluded from all counts; reappear if the channel is reopened (accepted).
 
@@ -102,6 +102,10 @@ Client (zql filter in the hooks) and server (Prisma `where` in the endpoint) eac
 // target: { workspaceId, count }                      // count = dmCount + bellCount + callCount
 ```
 
+**Why `userId` exists today:** an org member holds one `user` identity per workspace ([activityService.ts:725-735](apps/backend/src/services/activity/activityService.ts#L725-L735)), and the response is a direct dump of a Prisma `groupBy userId` — one row per identity, with `userId` as the group key (and the disambiguator if a member holds two identities in one workspace). The client then merges rows per workspace itself, last-write-wins ([WorkspaceSwitcher.tsx:106-110](apps/dashboard/src/components/AppSidebar/WorkspaceSwitcher.tsx#L106-L110)).
+
+**Why it can be dropped:** the merge moves server-side (`groupBy workspaceId, SUM`), so `workspaceId` becomes the unique row key and a row may aggregate several identities — `userId` no longer identifies anything. The only consumer (WorkspaceSwitcher) never reads it; it reads `workspaceId` + `count` only. Dropping it removes the client-side last-write-wins race entirely. (Verify no out-of-repo consumer — e.g. a mobile app — reads `userId` before deploy, same check as the `count` semantics change below.)
+
 Computed internally, not exposed:
 
 - **`dmCount`** = `SUM(channel_user_status.unreadCount)` over the user's open (`isClosed = false`, `isDeleted = false`) DM/GROUP_DM channels **minus** unread top-level mention activities in GROUP_DM channels (per §3.1 rules; floored at 0 per channel).
@@ -124,7 +128,7 @@ Now doubly critical: the DM rail renders `channel_user_status.unreadCount` **dir
 
 - Zero mutators (`markChannelAsViewed`, `markChannelUnreadFrom`, `markMissedCallsAsRead`, activity read mutators) — untouched; they remain the write path Zero syncs.
 - Activity creation side-effects — untouched. No row is created or suppressed differently.
-- Classification pipeline — untouched this phase (SKIP handling per §2 note 4 / open Q1).
+- Classification pipeline — untouched this phase (Q1 → (b): leave the pipeline as-is; SKIP handling per §2 note 4).
 - `userMissedCalls` query, Calls rail — untouched.
 
 ## 4. Frontend changes
@@ -154,7 +158,7 @@ Read-mutation refetch triggers: emit `unread:refetch` from the state-machine obs
 // after:  const { totalAllWorkspaces } = useWorkspaceUnreadCounts();
 ```
 
-Update the doc comment (the "active workspace only" limitation is resolved). Behind flag `DOCK_BADGE_POLL_SOURCE`.
+Update the doc comment (the "active workspace only" limitation is resolved). Behind flag `DOCK_BADGE_POLL_SOURCE` — follow the existing env-flag pattern in [config.ts](apps/dashboard/src/config.ts) (like `VITE_ENABLE_SUMMARY_ACTION_BUTTON`).
 
 ### 4.3 `WorkspaceSwitcher` — migrate to shared hook
 
@@ -192,13 +196,9 @@ The DM list badges (and 4.4's rail) must subtract that channel's unread top-leve
 
 The bell *feed* continues to render rows the *count* excludes (e.g., missed-call cards). Deliberate: "keep activities as they were." The bell number may be less than visible feed items — accepted.
 
-## 5. Open question
+## 5. Resolved decisions
 
-**Q1 — "do not classify anything to skip":** two readings —
-- **(a)** actively extend the `mapClassification` coercion ([activityClassificationService.ts:1191](apps/backend/src/services/activity/activityClassificationService.ts#L1191)) so *all* LLM SKIP verdicts → FYI now (also stops the delete-on-SKIP path and its badge-count-then-vanish race; ~1-line change but touches the classification service), or
-- **(b)** leave the classification pipeline completely untouched this phase (current behavior: non-DM SKIP already coerces; DM SKIP rows deleted; new SKIP rows nearly impossible since XYNE-17185) — implement the "nothing is SKIP" state properly in the later classification PR.
-
-Counts behave identically either way (SKIP never counts). Lean: **(b)** — zero classification code touched, per "we will resolve this classification thing later."
+**Q1 — "do not classify anything to skip" → decided (b):** leave the classification pipeline completely untouched this phase (current behavior: non-DM SKIP already coerces; DM SKIP rows deleted; new SKIP rows nearly impossible since XYNE-17185) — implement the "nothing is SKIP" state properly in the later classification PR. Zero classification code touched. Counts behave identically either way (SKIP never counts).
 
 ## 6. Rollout
 
@@ -206,7 +206,7 @@ Counts behave identically either way (SKIP never counts). Lean: **(b)** — zero
 2. **Phase 1a:** backend — shared rules constant + endpoint change (`count` = dm+bell+call, identity merge). ⚠️ semantic change of `count`; verify external consumers first.
 3. **Phase 1b:** `useWorkspaceUnreadCounts` + WorkspaceSwitcher migration. Corrected numbers; no UI change.
 4. **Phase 1c:** bell filter updates (§4.5) + `useDmUnreadCount` rail badge + per-channel subtraction (§4.6) + reaction dots (§4.4). Rail numbers change visibly.
-5. **Phase 1d:** dock source switch (§4.2) behind `DOCK_BADGE_POLL_SOURCE`, default off; compare `|zeroSum − polledTotal|` in dev; flip on.
+5. **Phase 1d:** dock source switch (§4.2) behind `DOCK_BADGE_POLL_SOURCE`, default off; compare `|zeroSum − polledTotal|` in dev; flip on. (Classification handling per Q1 → (b): no changes this phase.)
 6. **Monitoring:** endpoint latency + DB load (alert if p95 > 200ms); log invariant violations — `count ≠ dm+bell+call` (structurally impossible server-side) and `switcher(activeWs) ≠ dmRail + bell + calls` beyond the 30s freshness window.
 
 ## 7. Test matrix
@@ -234,4 +234,4 @@ Counts behave identically either way (SKIP never counts). Lean: **(b)** — zero
 | state machine / read-mutation observers | emit `unread:refetch` after read mutations |
 | `apps/dashboard/src/routes/AppRoot.tsx` | mount shared hook provider |
 
-Not touched: Zero mutators, activity creation side-effects, classification pipeline (pending Q1), Calls rail query, bell feed rendering.
+Not touched: Zero mutators, activity creation side-effects, classification pipeline (Q1 → (b), left as-is this phase), Calls rail query, bell feed rendering.
