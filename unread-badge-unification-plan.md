@@ -149,7 +149,9 @@ Now doubly critical: the DM rail renders `channel_user_status.unreadCount` **dir
 - Single instance mounted next to `ElectronBadgeSync` ([AppRoot.tsx:968](apps/dashboard/src/routes/AppRoot.tsx#L968)); consumers via context
 - No rail consumes this hook — rails are Zero-synced
 
-Read-mutation refetch triggers: emit `unread:refetch` from the state-machine observers that already track these mutations (cleaner than touching every call site): `markChannelAsViewed` / `markChannelUnreadFrom` / `closeDm` / `reopenDm`, activity `markAsRead` / `markAsReadByFilter`, `markMissedCallsAsRead` ([CallHistoryScreen.tsx:585](apps/dashboard/src/routes/CallHistoryScreen/CallHistoryScreen.tsx#L585)).
+Read-mutation refetch triggers — emit `unread:refetch` after read mutations, **decided (Q3): centralized in the state-machine observers** that already track these mutations (one place, can't miss a call site), fired as a plain browser event (`window.dispatchEvent(new CustomEvent('unread:refetch'))` — no new event-bus module) via a tiny typed helper. Mutations covered: `markChannelAsViewed` / `markChannelUnreadFrom` / `closeDm` / `reopenDm`, activity `markAsRead` / `markAsReadByFilter`, `markMissedCallsAsRead` ([CallHistoryScreen.tsx:585](apps/dashboard/src/routes/CallHistoryScreen/CallHistoryScreen.tsx#L585)). Unit-tested: each mutator fires the event.
+
+**Freshness contract (Q2, confirmed):** reads in the *active* workspace clear the dock immediately via `unread:refetch` (rails are already instant via Zero). Changes that originate *outside this app instance* — events in a non-active workspace, or reads made on another device (phone / second desktop) — reach the dock and switcher only on the next ≤30s poll. Accepted; no live transport for non-active workspaces by design.
 
 ### 4.2 `useElectronBadge` — source switch ([useElectronBadge.ts](apps/dashboard/src/hooks/useElectronBadge.ts))
 
@@ -200,9 +202,11 @@ The bell *feed* continues to render rows the *count* excludes (e.g., missed-call
 
 **Q1 — "do not classify anything to skip" → decided (b):** leave the classification pipeline completely untouched this phase (current behavior: non-DM SKIP already coerces; DM SKIP rows deleted; new SKIP rows nearly impossible since XYNE-17185) — implement the "nothing is SKIP" state properly in the later classification PR. Zero classification code touched. Counts behave identically either way (SKIP never counts).
 
-## 6. Rollout
+**Branch strategy — single branch:** all phases (0, 1a–1d) land in one branch/PR. The §6 phase order still applies *within* the branch (commits sequenced Phase 0 → 1a → … → 1d) so the frozen-counter fix remains an independently revertable commit, and `DOCK_BADGE_POLL_SOURCE` still gates Phase 1d separately at deploy time.
 
-1. **Phase 0:** frozen-counter fix (§3.3) — independently shippable; fixes the live DM badge bug today.
+## 6. Rollout (single branch; commits sequenced, deploy-gated where noted)
+
+1. **Phase 0:** frozen-counter fix (§3.3) — first commit on the branch; independently revertable.
 2. **Phase 1a:** backend — shared rules constant + endpoint change (`count` = dm+bell+call, identity merge). ⚠️ semantic change of `count`; verify external consumers first.
 3. **Phase 1b:** `useWorkspaceUnreadCounts` + WorkspaceSwitcher migration. Corrected numbers; no UI change.
 4. **Phase 1c:** bell filter updates (§4.5) + `useDmUnreadCount` rail badge + per-channel subtraction (§4.6) + reaction dots (§4.4). Rail numbers change visibly.
